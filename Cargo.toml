@@ -1,0 +1,17 @@
+[package]
+name = "solana-program-svm-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solana-bpf-loader-program = "2.1.0"
+solana-client = "2.1.0"
+solana-compute-budget = "2.1.0"
+solana-logger = "2.1.0"
+solana-program-runtime = "2.1.0"
+solana-sdk = "2.1.0"
+solana-svm = "2.1.0"
+solana-svm-transaction = "2.1.0"
+solana-system-program = "2.1.0"
+spl-associated-token-account = "4.0.0"
+spl-token = "6.0.0"
