@@ -14,7 +14,7 @@ use solana_sdk::{
     hash::Hash,
     pubkey::Pubkey,
     rent_collector::RentCollector,
-    transaction,
+    transaction::{self, SanitizedTransaction, Transaction},
 };
 use solana_svm::{
     account_loader::CheckedTransactionDetails,
@@ -24,48 +24,19 @@ use solana_svm::{
         TransactionProcessingConfig, TransactionProcessingEnvironment,
     },
 };
-use solana_svm_transaction::svm_transaction::SVMTransaction;
 use solana_system_program::system_processor;
 
-pub struct ProgramSvmTest<'a> {
+pub struct ProgramSvmTest {
     accounts: ProgramSvmTestAccountLoader,
     fork_graph: Arc<RwLock<ProgramSvmTestForkGraph>>,
     compute_budget: ComputeBudget,
     feature_set: FeatureSet,
     fee_structure: FeeStructure,
     rent_collector: RentCollector,
-    client: Arc<Option<ProgramSvmTestClient<'a>>>,
+    // client: Arc<Option<ProgramSvmTestClient<'a>>>,
 }
 
-#[derive(Default)]
-pub struct ProgramSvmTestClient<'a> {
-    processing_environment: TransactionProcessingEnvironment<'a>,
-    processor: TransactionBatchProcessor<ProgramSvmTestForkGraph>,
-}
-
-impl<'a> ProgramSvmTestClient<'a> {
-    pub fn process_transaction_batch(
-        &self,
-        sanitized_txs: &[impl SVMTransaction],
-        compute_budget: ComputeBudget,
-        callbacks: &ProgramSvmTestAccountLoader,
-        lamports_per_signature: u64,
-    ) -> LoadAndExecuteSanitizedTransactionsOutput {
-        let config = TransactionProcessingConfig {
-            compute_budget: Some(compute_budget),
-            ..Default::default()
-        };
-        self.processor.load_and_execute_sanitized_transactions(
-            callbacks,
-            sanitized_txs,
-            get_transaction_check_results(sanitized_txs.len(), lamports_per_signature),
-            &self.processing_environment,
-            &config,
-        )
-    }
-}
-
-impl<'a> Default for ProgramSvmTest<'a> {
+impl Default for ProgramSvmTest {
     fn default() -> Self {
         let compute_budget = ComputeBudget::default();
         let feature_set = FeatureSet::all_enabled();
@@ -80,12 +51,13 @@ impl<'a> Default for ProgramSvmTest<'a> {
             feature_set,
             fee_structure,
             rent_collector,
-            client: Arc::new(None),
+            // client: Arc::new(None),
         }
     }
 }
-impl<'a> ProgramSvmTest<'a> {
-    pub fn new() -> ProgramSvmTest<'a> {
+impl ProgramSvmTest {
+    pub fn new() -> ProgramSvmTest {
+        // TODO also add a default payer account
         ProgramSvmTest::default()
     }
 
@@ -97,7 +69,11 @@ impl<'a> ProgramSvmTest<'a> {
         todo!();
     }
 
-    pub async fn start_with_context(&'a mut self) {
+    // TODO add additional methods to set/override the internal state (compute_budget, feature_set, fee_structure, rent_collector)
+
+    // TODO this method in the original ProgramTest crate consumes self so that self cannot be reused once the bank was initialized
+    // It would make sense to do it here too.
+    pub fn start(&mut self) -> ProgramSvmTestClient {
         let processor = create_transaction_batch_processor(
             &self.accounts,
             &self.feature_set,
@@ -113,30 +89,53 @@ impl<'a> ProgramSvmTest<'a> {
             lamports_per_signature: self.fee_structure.lamports_per_signature,
             rent_collector: Some(&self.rent_collector),
         };
-        self.client = Arc::new(Some(ProgramSvmTestClient {
+        ProgramSvmTestClient {
             processing_environment,
             processor,
-        }));
+            accounts: &self.accounts,
+        }
     }
-    pub fn process_transaction_batch(
+}
+
+pub struct ProgramSvmTestClient<'a> {
+    processing_environment: TransactionProcessingEnvironment<'a>,
+    processor: TransactionBatchProcessor<ProgramSvmTestForkGraph>,
+    accounts: &'a ProgramSvmTestAccountLoader, // TODO this should be probably in Arc<RwLock<_>>
+}
+
+impl<'a> ProgramSvmTestClient<'a> {
+    pub fn process_transaction(
         &self,
-        sanitized_txs: &[impl SVMTransaction],
+        transaction: Transaction,
     ) -> LoadAndExecuteSanitizedTransactionsOutput {
+        // TODO for now only default tx config, it would be good to have optional config parameter
         let config = TransactionProcessingConfig {
-            compute_budget: Some(self.compute_budget),
+            // compute_budget: Some(compute_budget),
+            compute_budget: Some(ComputeBudget::default()),
             ..Default::default()
         };
-        let x = self.client.as_ref();
-        if let Some(ref processor) = self.client.as_ref() {
-            processor.process_transaction_batch(
-                sanitized_txs,
-                self.compute_budget,
-                &self.accounts,
-                self.fee_structure.lamports_per_signature,
-            )
-        } else {
-            panic!("The test framework is not initialized. Did you run `start_with_context`?")
-        }
+
+        let sanitized_txs = &[SanitizedTransaction::from_transaction_for_tests(
+            transaction,
+        )];
+        self.processor.load_and_execute_sanitized_transactions(
+            self.accounts,
+            sanitized_txs,
+            get_transaction_check_results(
+                sanitized_txs.len(),
+                self.processing_environment.lamports_per_signature,
+            ),
+            &self.processing_environment,
+            &config,
+        )
+    }
+
+    pub fn get_last_blockhash(&self) -> Hash {
+        self.processing_environment.blockhash
+    }
+
+    pub fn get_account(&self, address: &Pubkey) -> Option<AccountSharedData> {
+        self.accounts.get_account_shared_data(address)
     }
 }
 
@@ -279,13 +278,44 @@ impl ForkGraph for ProgramSvmTestForkGraph {
         BlockRelation::Unknown
     }
 }
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
+#[cfg(test)]
+mod tests {
+    use solana_sdk::{signature::Keypair, signer::Signer, system_instruction};
 
-//     #[test]
-//     fn it_works() {
-//         let result = 4;
-//         assert_eq!(result, 4);
-//     }
-// }
+    use super::*;
+
+    #[test]
+    fn test_create_account() {
+        let mut test_program = ProgramSvmTest::new();
+        let payer = Keypair::new();
+        let source = Keypair::new();
+        dbg!(payer.pubkey().to_string());
+        dbg!(source.pubkey().to_string());
+        test_program.add_account(
+            payer.pubkey(),
+            AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
+        );
+        let client = test_program.start();
+        let acc = client.get_account(&payer.pubkey());
+        dbg!(acc);
+        let instructions = vec![system_instruction::create_account(
+            &payer.pubkey(),
+            &source.pubkey(),
+            500_000_000,
+            0,
+            &solana_system_program::id(),
+        )];
+
+        let transaction = Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&payer.pubkey()),
+            &[&payer, &source],
+            client.get_last_blockhash(),
+        );
+        let result = client.process_transaction(transaction);
+        dbg!(result.processing_results.first());
+        let acc = client.get_account(&source.pubkey());
+        // dbg!(acc);
+        assert!(acc.is_some());
+    }
+}
