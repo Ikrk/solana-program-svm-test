@@ -14,18 +14,22 @@ use solana_sdk::{
     hash::Hash,
     pubkey::Pubkey,
     rent_collector::RentCollector,
-    transaction::{self, SanitizedTransaction, Transaction},
+    transaction::{self, SanitizedTransaction, Transaction, TransactionError},
 };
 use solana_svm::{
     account_loader::CheckedTransactionDetails,
+    rollback_accounts::RollbackAccounts,
     transaction_processing_callback::{AccountState, TransactionProcessingCallback},
+    transaction_processing_result::ProcessedTransaction,
     transaction_processor::{
-        LoadAndExecuteSanitizedTransactionsOutput, TransactionBatchProcessor,
-        TransactionProcessingConfig, TransactionProcessingEnvironment,
+        TransactionBatchProcessor, TransactionProcessingConfig, TransactionProcessingEnvironment,
     },
 };
 use solana_system_program::system_processor;
 
+use solana_svm_transaction::svm_message::SVMMessage;
+
+pub type TransactionProcessingResult = Result<(), TransactionError>;
 pub struct ProgramSvmTest {
     accounts: ProgramSvmTestAccountLoader,
     fork_graph: Arc<RwLock<ProgramSvmTestForkGraph>>,
@@ -33,7 +37,6 @@ pub struct ProgramSvmTest {
     feature_set: FeatureSet,
     fee_structure: FeeStructure,
     rent_collector: RentCollector,
-    // client: Arc<Option<ProgramSvmTestClient<'a>>>,
 }
 
 impl Default for ProgramSvmTest {
@@ -51,7 +54,6 @@ impl Default for ProgramSvmTest {
             feature_set,
             fee_structure,
             rent_collector,
-            // client: Arc::new(None),
         }
     }
 }
@@ -107,7 +109,9 @@ impl<'a> ProgramSvmTestClient<'a> {
     pub fn process_transaction(
         &self,
         transaction: Transaction,
-    ) -> LoadAndExecuteSanitizedTransactionsOutput {
+        // ) -> LoadAndExecuteSanitizedTransactionsOutput {
+    ) -> TransactionProcessingResult {
+        // TODO add custom ProgramSvmTestClient errors
         // TODO for now only default tx config, it would be good to have optional config parameter
         let config = TransactionProcessingConfig {
             // compute_budget: Some(compute_budget),
@@ -118,7 +122,7 @@ impl<'a> ProgramSvmTestClient<'a> {
         let sanitized_txs = &[SanitizedTransaction::from_transaction_for_tests(
             transaction,
         )];
-        self.processor.load_and_execute_sanitized_transactions(
+        let batch_output = self.processor.load_and_execute_sanitized_transactions(
             self.accounts,
             sanitized_txs,
             get_transaction_check_results(
@@ -127,7 +131,45 @@ impl<'a> ProgramSvmTestClient<'a> {
             ),
             &self.processing_environment,
             &config,
-        )
+        );
+
+        let mut final_accounts_actual = self.accounts.account_shared_data.read().unwrap().clone();
+
+        assert_eq!(batch_output.processing_results.len(), 1);
+
+        let processed_transaction = batch_output.processing_results.first().unwrap();
+        match processed_transaction {
+            Ok(ProcessedTransaction::Executed(executed_transaction)) => {
+                for (pubkey, account_data) in
+                    executed_transaction.loaded_transaction.accounts.clone()
+                {
+                    final_accounts_actual.insert(pubkey, account_data);
+                }
+            }
+            Ok(ProcessedTransaction::FeesOnly(fees_only_transaction)) => {
+                let fee_payer = sanitized_txs[0].fee_payer();
+
+                match fees_only_transaction.rollback_accounts.clone() {
+                    RollbackAccounts::FeePayerOnly { fee_payer_account } => {
+                        final_accounts_actual.insert(*fee_payer, fee_payer_account);
+                    }
+                    RollbackAccounts::SameNonceAndFeePayer { nonce } => {
+                        final_accounts_actual.insert(*nonce.address(), nonce.account().clone());
+                    }
+                    RollbackAccounts::SeparateNonceAndFeePayer {
+                        nonce,
+                        fee_payer_account,
+                    } => {
+                        final_accounts_actual.insert(*fee_payer, fee_payer_account);
+                        final_accounts_actual.insert(*nonce.address(), nonce.account().clone());
+                    }
+                }
+            }
+            Err(e) => return Err(e.clone()),
+        }
+        let mut accounts_to_update = self.accounts.account_shared_data.write().unwrap();
+        *accounts_to_update = final_accounts_actual;
+        Ok(())
     }
 
     pub fn get_last_blockhash(&self) -> Hash {
@@ -136,6 +178,14 @@ impl<'a> ProgramSvmTestClient<'a> {
 
     pub fn get_account(&self, address: &Pubkey) -> Option<AccountSharedData> {
         self.accounts.get_account_shared_data(address)
+    }
+
+    fn _prepare_transactions(transactions: &[Transaction]) -> Vec<SanitizedTransaction> {
+        transactions
+            .iter()
+            .cloned()
+            .map(|tx| SanitizedTransaction::from_transaction_for_tests(tx))
+            .collect()
     }
 }
 
@@ -312,10 +362,9 @@ mod tests {
             &[&payer, &source],
             client.get_last_blockhash(),
         );
-        let result = client.process_transaction(transaction);
-        dbg!(result.processing_results.first());
+        let _ = client.process_transaction(transaction).unwrap();
         let acc = client.get_account(&source.pubkey());
-        // dbg!(acc);
         assert!(acc.is_some());
+        assert_eq!(acc.unwrap().lamports(), 500_000_000);
     }
 }
