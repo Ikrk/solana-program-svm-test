@@ -1,18 +1,28 @@
 use std::{
     collections::HashMap,
+    env,
+    fs::{self, File},
+    io::Read,
     sync::{Arc, RwLock},
 };
 
+use serde::{Deserialize, Serialize};
 use solana_bpf_loader_program::syscalls::create_program_runtime_environment_v1;
 use solana_compute_budget::compute_budget::ComputeBudget;
-use solana_program_runtime::loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry};
+use solana_program_runtime::{
+    invoke_context::BuiltinFunctionWithContext,
+    loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry},
+};
 use solana_sdk::{
-    account::{AccountSharedData, ReadableAccount},
+    account::{AccountSharedData, ReadableAccount, WritableAccount},
+    bpf_loader_upgradeable::{self, UpgradeableLoaderState},
     clock::Slot,
+    compute_budget,
     feature_set::FeatureSet,
     fee::FeeStructure,
     hash::Hash,
     pubkey::Pubkey,
+    rent::Rent,
     rent_collector::RentCollector,
     transaction::{self, SanitizedTransaction, Transaction, TransactionError},
 };
@@ -67,8 +77,95 @@ impl ProgramSvmTest {
         self.accounts.add_account(address, account);
     }
 
-    pub fn add_program() {
-        todo!();
+    pub fn add_program(
+        &mut self,
+        program_name: &'static str,
+        program_id: Pubkey,
+        deployment_slot: Slot,
+        builtin_function: Option<BuiltinFunctionWithContext>,
+    ) -> Pubkey {
+        self.add_upgradable_program(
+            program_name,
+            program_id,
+            deployment_slot,
+            builtin_function,
+            None,
+        )
+    }
+
+    pub fn add_upgradable_program(
+        &mut self,
+        program_name: &'static str,
+        program_id: Pubkey,
+        deployment_slot: Slot,
+        _builtin_function: Option<BuiltinFunctionWithContext>, // TODO add support for natively compiled programs
+        upgrade_authority_address: Option<Pubkey>,
+    ) -> Pubkey {
+        let rent = Rent::default();
+        let program_account = program_id;
+        let program_data_account =
+            bpf_loader_upgradeable::get_program_data_address(&program_account);
+
+        let state = UpgradeableLoaderState::Program {
+            programdata_address: program_data_account,
+        };
+
+        // The program account must have funds and hold the executable binary
+        // let mut account_data = AccountSharedData::default();
+        // let buffer = bincode::serialize(&state).unwrap();
+        let mut account_data = AccountSharedData::new_data(
+            rent.minimum_balance(UpgradeableLoaderState::size_of_program()),
+            &state,
+            &bpf_loader_upgradeable::id(),
+        )
+        .unwrap();
+        // account_data.set_lamports(rent.minimum_balance(buffer.len()));
+        // account_data.set_owner(bpf_loader_upgradeable::id());
+        account_data.set_executable(true);
+        // account_data.set_data(buffer);
+        self.accounts
+            .account_shared_data
+            .write()
+            .unwrap()
+            .insert(program_account, account_data);
+
+        // let mut account_data = AccountSharedData::default();
+        // let state = UpgradeableLoaderState::ProgramData {
+        //     slot: deployment_slot,
+        //     upgrade_authority_address,
+        // };
+        // let mut header = bincode::serialize(&state).unwrap();
+        // let mut complement = vec![
+        //     0;
+        //     std::cmp::max(
+        //         0,
+        //         UpgradeableLoaderState::size_of_programdata_metadata().saturating_sub(header.len())
+        //     )
+        // ];
+        let program_data = load_program(program_name);
+        let state = ProgramSvmTestUpgradableLoaderState::new(
+            deployment_slot,
+            upgrade_authority_address,
+            program_data,
+        );
+        let account_data = AccountSharedData::new_data(
+            rent.minimum_balance(state.len()),
+            &state,
+            &bpf_loader_upgradeable::id(),
+        )
+        .unwrap();
+        // account_data.set_lamports(
+        //     rent.minimum_balance(UpgradeableLoaderState::size_of_programdata(buffer.len())),
+        // );
+        // account_data.set_owner(bpf_loader_upgradeable::id());
+        // account_data.set_data(header);
+        self.accounts
+            .account_shared_data
+            .write()
+            .unwrap()
+            .insert(program_data_account, account_data);
+
+        program_account
     }
 
     // TODO add additional methods to set/override the internal state (compute_budget, feature_set, fee_structure, rent_collector)
@@ -99,6 +196,31 @@ impl ProgramSvmTest {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+struct ProgramSvmTestUpgradableLoaderState {
+    loader_state: UpgradeableLoaderState,
+    program_data: Vec<u8>,
+}
+
+impl ProgramSvmTestUpgradableLoaderState {
+    fn new(
+        deployment_slot: u64,
+        upgrade_authority_address: Option<Pubkey>,
+        program_data: Vec<u8>,
+    ) -> Self {
+        let loader_state = UpgradeableLoaderState::ProgramData {
+            slot: deployment_slot,
+            upgrade_authority_address,
+        };
+        Self {
+            loader_state,
+            program_data,
+        }
+    }
+    fn len(&self) -> usize {
+        UpgradeableLoaderState::size_of_programdata(self.program_data.len())
+    }
+}
 pub struct ProgramSvmTestClient<'a> {
     processing_environment: TransactionProcessingEnvironment<'a>,
     processor: TransactionBatchProcessor<ProgramSvmTestForkGraph>,
@@ -133,11 +255,12 @@ impl<'a> ProgramSvmTestClient<'a> {
             &config,
         );
 
-        let mut final_accounts_actual = self.accounts.account_shared_data.read().unwrap().clone();
+        let mut final_accounts_actual = self.accounts.account_shared_data.write().unwrap();
 
         assert_eq!(batch_output.processing_results.len(), 1);
 
         let processed_transaction = batch_output.processing_results.first().unwrap();
+        dbg!(processed_transaction);
         match processed_transaction {
             Ok(ProcessedTransaction::Executed(executed_transaction)) => {
                 for (pubkey, account_data) in
@@ -167,8 +290,6 @@ impl<'a> ProgramSvmTestClient<'a> {
             }
             Err(e) => return Err(e.clone()),
         }
-        let mut accounts_to_update = self.accounts.account_shared_data.write().unwrap();
-        *accounts_to_update = final_accounts_actual;
         Ok(())
     }
 
@@ -203,6 +324,21 @@ pub(crate) fn get_transaction_check_results(
         });
         len
     ]
+}
+
+fn load_program(name: &str) -> Vec<u8> {
+    // Loading the program file
+    let mut dir = env::current_dir().unwrap();
+    dir.push("tests");
+    dir.push("example-programs");
+    dir.push(name);
+    let name = name.replace('-', "_");
+    dir.push(name + "_program.so");
+    let mut file = File::open(dir.clone()).expect("file not found");
+    let metadata = fs::metadata(dir).expect("Unable to read metadata");
+    let mut buffer = vec![0; metadata.len() as usize];
+    file.read_exact(&mut buffer).expect("Buffer overflow");
+    buffer
 }
 
 pub(crate) fn create_transaction_batch_processor<CB: TransactionProcessingCallback>(
@@ -250,6 +386,16 @@ pub(crate) fn create_transaction_batch_processor<CB: TransactionProcessingCallba
             0,
             b"solana_bpf_loader_program".len(),
             solana_bpf_loader_program::Entrypoint::vm,
+        ),
+    );
+    processor.add_builtin(
+        callbacks,
+        compute_budget::id(),
+        "compute_budget_program",
+        ProgramCacheEntry::new_builtin(
+            0,
+            "compute_budget_program".len(),
+            solana_compute_budget_program::Entrypoint::vm,
         ),
     );
 
@@ -330,7 +476,9 @@ impl ForkGraph for ProgramSvmTestForkGraph {
 }
 #[cfg(test)]
 mod tests {
-    use solana_sdk::{signature::Keypair, signer::Signer, system_instruction};
+    use solana_sdk::{
+        instruction::Instruction, signature::Keypair, signer::Signer, system_instruction,
+    };
 
     use super::*;
 
@@ -339,8 +487,11 @@ mod tests {
         let mut test_program = ProgramSvmTest::new();
         let payer = Keypair::new();
         let source = Keypair::new();
+        let program_id = Pubkey::new_unique();
         dbg!(payer.pubkey().to_string());
         dbg!(source.pubkey().to_string());
+        dbg!(program_id.to_string());
+        test_program.add_program("hello-solana", program_id, 0, None);
         test_program.add_account(
             payer.pubkey(),
             AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
@@ -348,13 +499,14 @@ mod tests {
         let client = test_program.start();
         let acc = client.get_account(&payer.pubkey());
         dbg!(acc);
-        let instructions = vec![system_instruction::create_account(
+        let mut instructions = vec![system_instruction::create_account(
             &payer.pubkey(),
             &source.pubkey(),
             500_000_000,
             0,
             &solana_system_program::id(),
         )];
+        instructions.push(Instruction::new_with_bytes(program_id, &[], vec![]));
 
         let transaction = Transaction::new_signed_with_payer(
             &instructions,

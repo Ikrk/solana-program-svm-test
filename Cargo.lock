@@ -3854,9 +3854,16 @@ dependencies = [
 name = "solana-program-svm-test"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "serde",
+ "serde_bytes",
+ "serde_derive",
+ "serde_json",
+ "serde_with",
  "solana-bpf-loader-program",
  "solana-client",
  "solana-compute-budget",
+ "solana-compute-budget-program",
  "solana-logger",
  "solana-program-runtime",
  "solana-sdk",
