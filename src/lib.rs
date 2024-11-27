@@ -3,6 +3,7 @@ use std::{
     env,
     fs::{self, File},
     io::Read,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
 
@@ -83,6 +84,11 @@ impl Default for ProgramSvmTest {
 }
 impl ProgramSvmTest {
     pub fn new() -> ProgramSvmTest {
+        solana_logger::setup_with_default(
+            "solana_rbpf::vm=debug,\
+                     solana_runtime::message_processor=debug,\
+                     solana_runtime::system_instruction_processor=trace",
+        );
         // TODO also add a default payer account
         let mut program_test = ProgramSvmTest::default();
         program_test.add_program("token", TOKEN_ID, 0, None);
@@ -354,30 +360,71 @@ pub(crate) fn get_transaction_check_results(
     ]
 }
 
+fn default_shared_object_dirs() -> Vec<PathBuf> {
+    let mut search_path = vec![PathBuf::from("programs")];
+
+    if let Ok(bpf_out_dir) = std::env::var("BPF_OUT_DIR") {
+        search_path.push(PathBuf::from(bpf_out_dir));
+    }
+
+    if let Ok(bpf_out_dir) = std::env::var("SBF_OUT_DIR") {
+        search_path.push(PathBuf::from(bpf_out_dir));
+    }
+
+    if let Ok(dir) = std::env::current_dir() {
+        search_path.push(dir);
+    }
+
+    search_path
+}
+
+fn find_file(filename: &str) -> Option<PathBuf> {
+    for dir in default_shared_object_dirs() {
+        let candidate = dir.join(filename);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+pub fn read_file<P: AsRef<Path>>(path: P) -> Vec<u8> {
+    let path = path.as_ref();
+    let mut file = File::open(path).expect("Could not open the file");
+
+    let mut file_data = Vec::new();
+    file.read_to_end(&mut file_data)
+        .expect("could not read the file");
+    file_data
+}
+
 fn load_program(name: &str) -> Vec<u8> {
     // Loading the program file, first look in the programs folder
-    let mut dir = env::current_dir().unwrap();
-    dir.push("programs");
-    let binary_name = name.replace('-', "_");
-    dir.push(binary_name.clone() + ".so");
+    std::env::set_var("SBF_OUT_DIR", "./target/deploy");
+    // let mut dir = env::current_dir().unwrap();
+    // dir.push("programs");
+    let binary_name = format!("{}.so", name.replace('-', "_"));
+    // dir.push(binary_name.clone() + ".so");
 
-    let mut file = if let Ok(file) = File::open(dir.clone()) {
-        file
-    } else {
-        // if not found check other locations
-        // TODO check target folder
-        dir = env::current_dir().unwrap();
-        dir.push("tests");
-        dir.push("example-programs");
-        dir.push(name);
-        dir.push(binary_name + "_program.so");
-        File::open(dir.clone()).expect("File not found")
-    };
+    let file = find_file(&binary_name).expect("File not found");
+    // let mut file = if let Ok(file) = File::open(dir.clone()) {
+    //     file
+    // } else {
+    //     // if not found check other locations
+    //     // TODO check target folder
+    //     dir = env::current_dir().unwrap();
+    //     dir.push("tests");
+    //     dir.push("example-programs");
+    //     dir.push(name);
+    //     dir.push(binary_name + "_program.so");
+    //     File::open(dir.clone()).expect("File not found")
+    // };
 
-    let metadata = fs::metadata(dir).expect("Unable to read metadata");
-    let mut buffer = vec![0; metadata.len() as usize];
-    file.read_exact(&mut buffer).expect("Buffer overflow");
-    buffer
+    // let metadata = fs::metadata(file).expect("Unable to read metadata");
+    // let mut buffer = vec![0; metadata.len() as usize];
+    // file.read_exact(&mut buffer).expect("Buffer overflow");
+    // buffer
+    read_file(file)
 }
 
 pub(crate) fn create_transaction_batch_processor<CB: TransactionProcessingCallback>(
@@ -574,7 +621,7 @@ mod tests {
         let program_id = Pubkey::new_unique();
 
         let mut test_program = ProgramSvmTest::new();
-        test_program.add_program("hello-solana", program_id, 0, None);
+        test_program.add_program("hello-solana-program", program_id, 0, None);
         test_program.add_account(
             payer.pubkey(),
             AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
@@ -598,7 +645,7 @@ mod tests {
         let program_id = Pubkey::new_unique();
 
         let mut test_program = ProgramSvmTest::new();
-        test_program.add_program("simple-transfer", program_id, 0, None);
+        test_program.add_program("simple-transfer-program", program_id, 0, None);
         test_program.add_account(
             payer.pubkey(),
             AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
