@@ -399,31 +399,10 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> Vec<u8> {
 }
 
 fn load_program(name: &str) -> Vec<u8> {
-    // Loading the program file, first look in the programs folder
     std::env::set_var("SBF_OUT_DIR", "./target/deploy");
-    // let mut dir = env::current_dir().unwrap();
-    // dir.push("programs");
     let binary_name = format!("{}.so", name.replace('-', "_"));
-    // dir.push(binary_name.clone() + ".so");
 
     let file = find_file(&binary_name).expect("File not found");
-    // let mut file = if let Ok(file) = File::open(dir.clone()) {
-    //     file
-    // } else {
-    //     // if not found check other locations
-    //     // TODO check target folder
-    //     dir = env::current_dir().unwrap();
-    //     dir.push("tests");
-    //     dir.push("example-programs");
-    //     dir.push(name);
-    //     dir.push(binary_name + "_program.so");
-    //     File::open(dir.clone()).expect("File not found")
-    // };
-
-    // let metadata = fs::metadata(file).expect("Unable to read metadata");
-    // let mut buffer = vec![0; metadata.len() as usize];
-    // file.read_exact(&mut buffer).expect("Buffer overflow");
-    // buffer
     read_file(file)
 }
 
@@ -676,5 +655,78 @@ mod tests {
         let payer_amount_after = client.get_account(&payer.pubkey()).unwrap().lamports();
         assert_eq!(acc.lamports(), amount);
         assert!(payer_amount_after < payer_amount_before - amount);
+    }
+
+    #[test]
+    fn test_token_2022() {
+        let mut test_program = ProgramSvmTest::new();
+        let payer = Keypair::new();
+        let user = Keypair::new();
+
+        test_program.add_account(
+            payer.pubkey(),
+            AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
+        );
+        test_program.add_account(
+            user.pubkey(),
+            AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
+        );
+        let client = test_program.start();
+
+        let token_2022_id = spl_token_2022::id();
+        let mint = Keypair::new();
+        // let rent = banks_client.get_rent().await.unwrap();
+        let space = 82;
+        let transaction = Transaction::new_signed_with_payer(
+            &[
+                system_instruction::create_account(
+                    &payer.pubkey(),
+                    &mint.pubkey(),
+                    // rent.minimum_balance(space),
+                    1_000_000_000,
+                    space as u64,
+                    &token_2022_id,
+                ),
+                spl_token_2022::instruction::initialize_mint2(
+                    &token_2022_id,
+                    &mint.pubkey(),
+                    &payer.pubkey(),
+                    None,
+                    6,
+                )
+                .unwrap(),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &mint],
+            client.get_last_blockhash(),
+        );
+        client.process_transaction(transaction).unwrap();
+        // let user_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+        //     &user.pubkey(),
+        //     &mint.pubkey(),
+        //     &token_2022_id,
+        // );
+        let ix = spl_associated_token_account::instruction::create_associated_token_account(
+            &user.pubkey(),
+            &user.pubkey(),
+            &mint.pubkey(),
+            &token_2022_id,
+        );
+        // let ix = spl_token_2022::instruction::initialize_account3(
+        //     &token_2022_id,
+        //     &user_ata,
+        //     &mint.pubkey(),
+        //     &user.pubkey(),
+        // )
+        // .unwrap();
+        client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&user.pubkey()),
+                &[&user],
+                client.get_last_blockhash(),
+            ))
+            .unwrap();
+        // spl_token_2022::instruction::mint_to(token_2022_id, mint.pubkey(), account_pubkey, owner_pubkey, signer_pubkeys, amount)
     }
 }
