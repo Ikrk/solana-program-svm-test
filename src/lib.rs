@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
-    env,
-    fs::{self, File},
+    fs::File,
     io::Read,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -302,6 +301,7 @@ impl<'a> ProgramSvmTestClient<'a> {
                 {
                     final_accounts_actual.insert(pubkey, account_data);
                 }
+                return executed_transaction.execution_details.status.clone();
             }
             Ok(ProcessedTransaction::FeesOnly(fees_only_transaction)) => {
                 let fee_payer = sanitized_txs[0].fee_payer();
@@ -321,10 +321,10 @@ impl<'a> ProgramSvmTestClient<'a> {
                         final_accounts_actual.insert(*nonce.address(), nonce.account().clone());
                     }
                 }
+                return Err(fees_only_transaction.load_error.clone());
             }
             Err(e) => return Err(e.clone()),
         }
-        Ok(())
     }
 
     pub fn get_last_blockhash(&self) -> Hash {
