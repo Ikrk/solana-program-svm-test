@@ -63,6 +63,7 @@ pub struct ProgramSvmTest {
 }
 
 impl Default for ProgramSvmTest {
+    /// Creates new barebone testing enviroment
     fn default() -> Self {
         let compute_budget = ComputeBudget::default();
         let feature_set = FeatureSet::all_enabled();
@@ -82,6 +83,7 @@ impl Default for ProgramSvmTest {
     }
 }
 impl ProgramSvmTest {
+    /// Creates new testing enviroment and adds commonly used programs (currently only Token, Token2022 and Associated Token programs)
     pub fn new() -> ProgramSvmTest {
         solana_logger::setup_with_default(
             "solana_rbpf::vm=debug,\
@@ -89,6 +91,7 @@ impl ProgramSvmTest {
                      solana_runtime::system_instruction_processor=trace",
         );
         // TODO also add a default payer account
+        // TODO also add other programs added by Solana's ProgramTest crate
         let mut program_test = ProgramSvmTest::default();
         program_test.add_program("token", TOKEN_ID, 0, None);
         program_test.add_program("token-2022", TOKEN_2022_ID, 0, None);
@@ -96,21 +99,9 @@ impl ProgramSvmTest {
         program_test
     }
 
+    /// Adds new account to the testing environment
     pub fn add_account(&mut self, address: Pubkey, account: AccountSharedData) {
         self.accounts.add_account(address, account);
-    }
-
-    pub fn add_program2(
-        &mut self,
-        program_name: &'static str,
-        program_id: Pubkey,
-        // deployment_slot: Slot,
-        // builtin_function: Option<BuiltinFunctionWithContext>,
-    ) {
-        self.programs.push(ProgramSvmTestProgramEntry {
-            program_id,
-            name: program_name.to_string(),
-        });
     }
 
     fn add_programs(&self, processor: &TransactionBatchProcessor<ProgramSvmTestForkGraph>) {
@@ -133,6 +124,9 @@ impl ProgramSvmTest {
         }
     }
 
+    /// Adds new non-upgradable program to the testing environment
+    ///
+    /// Natively compiled programs are currently not supported.
     pub fn add_program(
         &mut self,
         program_name: &'static str,
@@ -153,6 +147,9 @@ impl ProgramSvmTest {
         )
     }
 
+    /// Adds new upgradable program to the testing environment
+    ///
+    /// Natively compiled programs are currently not supported.
     pub fn add_upgradable_program(
         &mut self,
         program_name: &'static str,
@@ -208,6 +205,8 @@ impl ProgramSvmTest {
 
     // TODO this method in the original ProgramTest crate consumes self so that self cannot be reused once the bank was initialized
     // It would make sense to do it here too.
+
+    /// Initialize the processing environment
     pub fn start(&mut self) -> ProgramSvmTestClient {
         let processor = create_transaction_batch_processor(
             &self.accounts,
@@ -265,6 +264,7 @@ pub struct ProgramSvmTestClient<'a> {
 }
 
 impl<'a> ProgramSvmTestClient<'a> {
+    /// Processes a transaction
     pub fn process_transaction(&self, transaction: Transaction) -> TransactionProcessingResult {
         // TODO add custom ProgramSvmTestClient errors
         // TODO for now only default tx config, it would be good to have optional config parameter
@@ -345,7 +345,7 @@ impl<'a> ProgramSvmTestClient<'a> {
 }
 
 /// This function is also a mock. In the Agave validator, the bank pre-checks
-/// transactions before providing them to the SVM API. We mock this step in
+/// transactions before providing them to the SVM API. We mock this step
 /// since we don't need to perform such pre-checks.
 pub(crate) fn get_transaction_check_results(
     len: usize,
