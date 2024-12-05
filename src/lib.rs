@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{Arc, RwLock},
 };
 
@@ -25,6 +26,7 @@ use solana_sdk::{
     pubkey::Pubkey,
     rent::Rent,
     rent_collector::RentCollector,
+    sysvar::{Sysvar, SysvarId},
     transaction::{self, SanitizedTransaction, Transaction, TransactionError},
 };
 use solana_svm::{
@@ -102,6 +104,19 @@ impl ProgramSvmTest {
     /// Adds new account to the testing environment
     pub fn add_account(&mut self, address: Pubkey, account: AccountSharedData) {
         self.accounts.add_account(address, account);
+    }
+
+    fn add_rent_sysvar(&mut self, processor: &TransactionBatchProcessor<ProgramSvmTestForkGraph>) {
+        let rent = Rent::default();
+        let account = AccountSharedData::create(
+            rent.minimum_balance(Rent::size_of()),
+            bincode::serialize(&rent).unwrap(),
+            Pubkey::from_str("Sysvar1111111111111111111111111111111111111").unwrap(),
+            false,
+            0,
+        );
+        self.add_account(Rent::id(), account);
+        processor.fill_missing_sysvar_cache_entries(&self.accounts);
     }
 
     fn add_programs(&self, processor: &TransactionBatchProcessor<ProgramSvmTestForkGraph>) {
@@ -214,6 +229,7 @@ impl ProgramSvmTest {
             &self.compute_budget,
             Arc::clone(&self.fork_graph),
         );
+        self.add_rent_sysvar(&processor);
         let processing_environment = TransactionProcessingEnvironment {
             blockhash: Hash::default(),
             epoch_total_stake: None,
@@ -301,7 +317,7 @@ impl<'a> ProgramSvmTestClient<'a> {
                 {
                     final_accounts_actual.insert(pubkey, account_data);
                 }
-                return executed_transaction.execution_details.status.clone();
+                executed_transaction.execution_details.status.clone()
             }
             Ok(ProcessedTransaction::FeesOnly(fees_only_transaction)) => {
                 let fee_payer = sanitized_txs[0].fee_payer();
@@ -321,9 +337,9 @@ impl<'a> ProgramSvmTestClient<'a> {
                         final_accounts_actual.insert(*nonce.address(), nonce.account().clone());
                     }
                 }
-                return Err(fees_only_transaction.load_error.clone());
+                Err(fees_only_transaction.load_error.clone())
             }
-            Err(e) => return Err(e.clone()),
+            Err(e) => Err(e.clone()),
         }
     }
 
@@ -555,6 +571,7 @@ impl ForkGraph for ProgramSvmTestForkGraph {
 mod tests {
     use solana_sdk::{
         instruction::{AccountMeta, Instruction},
+        program_pack::Pack,
         signature::Keypair,
         signer::Signer,
         system_instruction, system_program,
@@ -658,6 +675,95 @@ mod tests {
     }
 
     #[test]
+    fn test_token_legacy() {
+        let mut test_program = ProgramSvmTest::new();
+        let payer = Keypair::new();
+        let user = Keypair::new();
+
+        test_program.add_account(
+            payer.pubkey(),
+            AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
+        );
+        test_program.add_account(
+            user.pubkey(),
+            AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
+        );
+        let client = test_program.start();
+        let mint = Keypair::new();
+        let minimum_balance = Rent::default().minimum_balance(spl_token::state::Mint::LEN);
+        let transaction = Transaction::new_signed_with_payer(
+            &[
+                system_instruction::create_account(
+                    &payer.pubkey(),
+                    &mint.pubkey(),
+                    minimum_balance,
+                    spl_token::state::Mint::LEN as u64,
+                    &spl_token::id(),
+                ),
+                spl_token::instruction::initialize_mint2(
+                    &spl_token::id(),
+                    &mint.pubkey(),
+                    &payer.pubkey(),
+                    None,
+                    6,
+                )
+                .unwrap(),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &mint],
+            client.get_last_blockhash(),
+        );
+        client.process_transaction(transaction).unwrap();
+        let mint_data = client.get_account(&mint.pubkey()).unwrap();
+        let mint_deserialized = spl_token::state::Mint::unpack(mint_data.data()).unwrap();
+        assert_eq!(mint_deserialized.decimals, 6);
+
+        let token_account = Keypair::new();
+        let minimum_balance = Rent::default().minimum_balance(spl_token::state::Account::LEN);
+        let transaction = Transaction::new_signed_with_payer(
+            &[
+                system_instruction::create_account(
+                    &payer.pubkey(),
+                    &token_account.pubkey(),
+                    minimum_balance,
+                    spl_token::state::Account::LEN as u64,
+                    &spl_token::id(),
+                ),
+                spl_token::instruction::initialize_account3(
+                    &spl_token::id(),
+                    &token_account.pubkey(),
+                    &mint.pubkey(),
+                    &payer.pubkey(),
+                )
+                .unwrap(),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &token_account],
+            client.get_last_blockhash(),
+        );
+        client.process_transaction(transaction).unwrap();
+        let ix = spl_token::instruction::mint_to(
+            &spl_token::id(),
+            &mint.pubkey(),
+            &token_account.pubkey(),
+            &payer.pubkey(),
+            &[&payer.pubkey()],
+            100000,
+        )
+        .unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            client.get_last_blockhash(),
+        );
+        client.process_transaction(tx).unwrap();
+        let token_data = client.get_account(&token_account.pubkey()).unwrap();
+        let token_deserialized = spl_token::state::Account::unpack(token_data.data()).unwrap();
+        assert_eq!(token_deserialized.amount, 100000);
+    }
+
+    #[test]
     fn test_token_2022() {
         let mut test_program = ProgramSvmTest::new();
         let payer = Keypair::new();
@@ -672,23 +778,19 @@ mod tests {
             AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
         );
         let client = test_program.start();
-
-        let token_2022_id = spl_token_2022::id();
         let mint = Keypair::new();
-        // let rent = banks_client.get_rent().await.unwrap();
-        let space = 82;
+        let minimum_balance = Rent::default().minimum_balance(spl_token_2022::state::Mint::LEN);
         let transaction = Transaction::new_signed_with_payer(
             &[
                 system_instruction::create_account(
                     &payer.pubkey(),
                     &mint.pubkey(),
-                    // rent.minimum_balance(space),
-                    1_000_000_000,
-                    space as u64,
-                    &token_2022_id,
+                    minimum_balance,
+                    spl_token_2022::state::Mint::LEN as u64,
+                    &spl_token_2022::id(),
                 ),
                 spl_token_2022::instruction::initialize_mint2(
-                    &token_2022_id,
+                    &spl_token_2022::id(),
                     &mint.pubkey(),
                     &payer.pubkey(),
                     None,
@@ -701,32 +803,52 @@ mod tests {
             client.get_last_blockhash(),
         );
         client.process_transaction(transaction).unwrap();
-        // let user_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
-        //     &user.pubkey(),
-        //     &mint.pubkey(),
-        //     &token_2022_id,
-        // );
-        let ix = spl_associated_token_account::instruction::create_associated_token_account(
-            &user.pubkey(),
-            &user.pubkey(),
-            &mint.pubkey(),
-            &token_2022_id,
+        let mint_data = client.get_account(&mint.pubkey()).unwrap();
+        let mint_deserialized = spl_token_2022::state::Mint::unpack(mint_data.data()).unwrap();
+        assert_eq!(mint_deserialized.decimals, 6);
+
+        let token_account = Keypair::new();
+        let minimum_balance = Rent::default().minimum_balance(spl_token_2022::state::Account::LEN);
+        let transaction = Transaction::new_signed_with_payer(
+            &[
+                system_instruction::create_account(
+                    &payer.pubkey(),
+                    &token_account.pubkey(),
+                    minimum_balance,
+                    spl_token_2022::state::Account::LEN as u64,
+                    &spl_token_2022::id(),
+                ),
+                spl_token_2022::instruction::initialize_account3(
+                    &spl_token_2022::id(),
+                    &token_account.pubkey(),
+                    &mint.pubkey(),
+                    &payer.pubkey(),
+                )
+                .unwrap(),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &token_account],
+            client.get_last_blockhash(),
         );
-        // let ix = spl_token_2022::instruction::initialize_account3(
-        //     &token_2022_id,
-        //     &user_ata,
-        //     &mint.pubkey(),
-        //     &user.pubkey(),
-        // )
-        // .unwrap();
-        client
-            .process_transaction(Transaction::new_signed_with_payer(
-                &[ix],
-                Some(&user.pubkey()),
-                &[&user],
-                client.get_last_blockhash(),
-            ))
-            .unwrap();
-        // spl_token_2022::instruction::mint_to(token_2022_id, mint.pubkey(), account_pubkey, owner_pubkey, signer_pubkeys, amount)
+        client.process_transaction(transaction).unwrap();
+        let ix = spl_token_2022::instruction::mint_to(
+            &spl_token_2022::id(),
+            &mint.pubkey(),
+            &token_account.pubkey(),
+            &payer.pubkey(),
+            &[&payer.pubkey()],
+            100000,
+        )
+        .unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            client.get_last_blockhash(),
+        );
+        client.process_transaction(tx).unwrap();
+        let token_data = client.get_account(&token_account.pubkey()).unwrap();
+        let token_deserialized = spl_token_2022::state::Account::unpack(token_data.data()).unwrap();
+        assert_eq!(token_deserialized.amount, 100000);
     }
 }
