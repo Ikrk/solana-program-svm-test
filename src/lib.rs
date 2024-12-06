@@ -15,6 +15,7 @@ use solana_program_runtime::{
 };
 use solana_sdk::{
     account::{AccountSharedData, ReadableAccount, WritableAccount},
+    bpf_loader,
     bpf_loader_upgradeable::{self, UpgradeableLoaderState},
     clock::Slot,
     compute_budget,
@@ -46,10 +47,15 @@ use sysvars::Sysvars;
 
 pub mod sysvars;
 
-pub const TOKEN_2022_ID: Pubkey =
+pub const TOKEN_2022_PROGRAM_ID: Pubkey =
     solana_sdk::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
-pub const TOKEN_ID: Pubkey = solana_sdk::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-pub const ASSOCIATED_TOKEN_ID: Pubkey =
+pub const TOKEN_PROGRAM_ID: Pubkey =
+    solana_sdk::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
+    solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+pub const MEMO_PROGRAM_ID: Pubkey =
+    solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+pub const MEMO_V1_PROGRAM_ID: Pubkey =
     solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
 pub type TransactionProcessingResult = Result<(), TransactionError>;
@@ -96,11 +102,13 @@ impl ProgramSvmTest {
                      solana_runtime::message_processor=debug,\
                      solana_runtime::system_instruction_processor=trace",
         );
-        // TODO also add other programs added by Solana's ProgramTest crate
+
         let mut program_test = ProgramSvmTest::default();
-        program_test.add_program("token", TOKEN_ID, 0, None);
-        program_test.add_program("token-2022", TOKEN_2022_ID, 0, None);
-        program_test.add_program("associated-token", ASSOCIATED_TOKEN_ID, 0, None);
+        program_test.add_program("token", TOKEN_PROGRAM_ID, 0, None);
+        program_test.add_program("token-2022", TOKEN_2022_PROGRAM_ID, 0, None);
+        program_test.add_program("associated-token", ASSOCIATED_TOKEN_PROGRAM_ID, 0, None);
+        program_test.add_program("memo", MEMO_PROGRAM_ID, 0, None);
+        program_test.add_program("memo-v1", MEMO_V1_PROGRAM_ID, 0, None);
 
         program_test
     }
@@ -170,13 +178,47 @@ impl ProgramSvmTest {
             program_id,
             name: program_name.to_string(),
         });
-        self.add_upgradable_program(
-            program_name,
-            program_id,
-            deployment_slot,
-            builtin_function,
-            None,
+        let rent = Rent::default();
+        let program_account = program_id;
+        let program_data_account =
+            bpf_loader_upgradeable::get_program_data_address(&program_account);
+
+        let state = UpgradeableLoaderState::Program {
+            programdata_address: program_data_account,
+        };
+
+        let mut account_data = AccountSharedData::new_data(
+            rent.minimum_balance(UpgradeableLoaderState::size_of_program()),
+            &state,
+            &bpf_loader::id(),
         )
+        .unwrap();
+        account_data.set_executable(true);
+        self.accounts
+            .account_shared_data
+            .write()
+            .unwrap()
+            .insert(program_account, account_data);
+
+        let program_data = load_program(program_name);
+        // let state = ProgramSvmTestUpgradableLoaderState::new(
+        //     deployment_slot,
+        //     upgrade_authority_address,
+        //     program_data,
+        // );
+        let account_data = AccountSharedData::new_data(
+            rent.minimum_balance(program_data.len()),
+            &program_data,
+            &bpf_loader_upgradeable::id(),
+        )
+        .unwrap();
+        self.accounts
+            .account_shared_data
+            .write()
+            .unwrap()
+            .insert(program_data_account, account_data);
+
+        program_account
     }
 
     /// Adds new upgradable program to the testing environment
@@ -190,6 +232,11 @@ impl ProgramSvmTest {
         _builtin_function: Option<BuiltinFunctionWithContext>, // TODO add support for natively compiled programs
         upgrade_authority_address: Option<Pubkey>,
     ) -> Pubkey {
+        self.programs.push(ProgramSvmTestProgramEntry {
+            program_id,
+            name: program_name.to_string(),
+        });
+
         let rent = Rent::default();
         let program_account = program_id;
         let program_data_account =
@@ -419,14 +466,6 @@ impl<'a> ProgramSvmTestClient<'a> {
         self.processor
             .fill_missing_sysvar_cache_entries(self.accounts);
     }
-
-    fn _prepare_transactions(transactions: &[Transaction]) -> Vec<SanitizedTransaction> {
-        transactions
-            .iter()
-            .cloned()
-            .map(SanitizedTransaction::from_transaction_for_tests)
-            .collect()
-    }
 }
 
 /// This function is also a mock. In the Agave validator, the bank pre-checks
@@ -527,7 +566,27 @@ pub(crate) fn create_transaction_batch_processor<CB: TransactionProcessingCallba
         ),
     );
 
-    // Add the BPF Loader v2 builtin, for the SPL Token program.
+    // Add the BPF Loaders
+    processor.add_builtin(
+        callbacks,
+        solana_sdk::bpf_loader_deprecated::id(),
+        "solana_bpf_loader_program",
+        ProgramCacheEntry::new_builtin(
+            0,
+            b"solana_bpf_loader_program".len(),
+            solana_bpf_loader_program::Entrypoint::vm,
+        ),
+    );
+    processor.add_builtin(
+        callbacks,
+        solana_sdk::loader_v4::id(),
+        "solana_bpf_loader_program",
+        ProgramCacheEntry::new_builtin(
+            0,
+            b"solana_bpf_loader_program".len(),
+            solana_bpf_loader_program::Entrypoint::vm,
+        ),
+    );
     processor.add_builtin(
         callbacks,
         solana_sdk::bpf_loader::id(),
