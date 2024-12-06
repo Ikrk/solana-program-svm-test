@@ -25,6 +25,8 @@ use solana_sdk::{
     pubkey::Pubkey,
     rent::Rent,
     rent_collector::RentCollector,
+    signature::Keypair,
+    signer::Signer,
     slot_hashes::SlotHashes,
     transaction::{self, SanitizedTransaction, Transaction, TransactionError},
 };
@@ -94,12 +96,12 @@ impl ProgramSvmTest {
                      solana_runtime::message_processor=debug,\
                      solana_runtime::system_instruction_processor=trace",
         );
-        // TODO also add a default payer account
         // TODO also add other programs added by Solana's ProgramTest crate
         let mut program_test = ProgramSvmTest::default();
         program_test.add_program("token", TOKEN_ID, 0, None);
         program_test.add_program("token-2022", TOKEN_2022_ID, 0, None);
         program_test.add_program("associated-token", ASSOCIATED_TOKEN_ID, 0, None);
+
         program_test
     }
 
@@ -234,7 +236,14 @@ impl ProgramSvmTest {
     // TODO add additional methods to set/override the internal state (compute_budget, feature_set, fee_structure, rent_collector)
 
     /// Initialize the processing environment
-    pub fn start(&mut self) -> ProgramSvmTestClient {
+    pub fn start(&mut self) -> (ProgramSvmTestClient, Keypair) {
+        let payer = Keypair::new();
+
+        self.add_account(
+            payer.pubkey(),
+            AccountSharedData::new(5_000_000_000_000_000, 0, &solana_system_program::id()),
+        );
+
         let processor = create_transaction_batch_processor(
             &self.accounts,
             &self.feature_set,
@@ -252,11 +261,13 @@ impl ProgramSvmTest {
             rent_collector: Some(&self.rent_collector),
         };
         self.add_programs(&processor);
-        ProgramSvmTestClient {
+        let client = ProgramSvmTestClient {
             processing_environment,
             processor,
             accounts: &mut self.accounts,
-        }
+        };
+
+        (client, payer)
     }
 }
 
@@ -642,16 +653,11 @@ mod tests {
 
     #[test]
     fn test_create_account() {
-        let payer = Keypair::new();
         let user = Keypair::new();
 
         let mut test_program = ProgramSvmTest::new();
 
-        test_program.add_account(
-            payer.pubkey(),
-            AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
-        );
-        let client = test_program.start();
+        let (client, payer) = test_program.start();
         let instructions = vec![system_instruction::create_account(
             &payer.pubkey(),
             &user.pubkey(),
@@ -674,16 +680,11 @@ mod tests {
 
     #[test]
     fn test_hello_solana_program() {
-        let payer = Keypair::new();
         let program_id = Pubkey::new_unique();
 
         let mut test_program = ProgramSvmTest::new();
         test_program.add_program("hello-solana-program", program_id, 0, None);
-        test_program.add_account(
-            payer.pubkey(),
-            AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
-        );
-        let client = test_program.start();
+        let (client, payer) = test_program.start();
 
         let instructions = vec![Instruction::new_with_bytes(program_id, &[], vec![])];
         let transaction = Transaction::new_signed_with_payer(
@@ -697,17 +698,12 @@ mod tests {
 
     #[test]
     fn test_simple_transfer_program() {
-        let payer = Keypair::new();
         let recipient = Keypair::new();
         let program_id = Pubkey::new_unique();
 
         let mut test_program = ProgramSvmTest::new();
         test_program.add_program("simple-transfer-program", program_id, 0, None);
-        test_program.add_account(
-            payer.pubkey(),
-            AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
-        );
-        let client = test_program.start();
+        let (client, payer) = test_program.start();
         let payer_amount_before = client.get_account(&payer.pubkey()).unwrap().lamports();
         let amount = 600_000_000u64;
 
@@ -738,18 +734,13 @@ mod tests {
     #[test]
     fn test_token_legacy() {
         let mut test_program = ProgramSvmTest::new();
-        let payer = Keypair::new();
         let user = Keypair::new();
 
-        test_program.add_account(
-            payer.pubkey(),
-            AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
-        );
         test_program.add_account(
             user.pubkey(),
             AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
         );
-        let client = test_program.start();
+        let (client, payer) = test_program.start();
         let mint = Keypair::new();
         let minimum_balance = Rent::default().minimum_balance(spl_token::state::Mint::LEN);
         let transaction = Transaction::new_signed_with_payer(
@@ -827,18 +818,13 @@ mod tests {
     #[test]
     fn test_token_2022() {
         let mut test_program = ProgramSvmTest::new();
-        let payer = Keypair::new();
         let user = Keypair::new();
 
-        test_program.add_account(
-            payer.pubkey(),
-            AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
-        );
         test_program.add_account(
             user.pubkey(),
             AccountSharedData::new(5_000_000_000_000, 0, &solana_system_program::id()),
         );
-        let client = test_program.start();
+        let (client, payer) = test_program.start();
         let mint = Keypair::new();
         let minimum_balance = Rent::default().minimum_balance(spl_token_2022::state::Mint::LEN);
         let transaction = Transaction::new_signed_with_payer(
@@ -916,7 +902,7 @@ mod tests {
     #[test]
     fn test_warp_to_slot() {
         let mut test_program = ProgramSvmTest::new();
-        let mut client = test_program.start();
+        let (mut client, _) = test_program.start();
 
         let clock: Clock = client
             .get_account(&Clock::id())
