@@ -3,7 +3,6 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{Arc, RwLock},
 };
 
@@ -26,7 +25,7 @@ use solana_sdk::{
     pubkey::Pubkey,
     rent::Rent,
     rent_collector::RentCollector,
-    sysvar::{Sysvar, SysvarId},
+    slot_hashes::SlotHashes,
     transaction::{self, SanitizedTransaction, Transaction, TransactionError},
 };
 use solana_svm::{
@@ -41,6 +40,9 @@ use solana_svm::{
 use solana_system_program::system_processor;
 
 use solana_svm_transaction::svm_message::SVMMessage;
+use sysvars::Sysvars;
+
+pub mod sysvars;
 
 pub const TOKEN_2022_ID: Pubkey =
     solana_sdk::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
@@ -106,16 +108,29 @@ impl ProgramSvmTest {
         self.accounts.add_account(address, account);
     }
 
-    fn add_rent_sysvar(&mut self, processor: &TransactionBatchProcessor<ProgramSvmTestForkGraph>) {
-        let rent = Rent::default();
-        let account = AccountSharedData::create(
-            rent.minimum_balance(Rent::size_of()),
-            bincode::serialize(&rent).unwrap(),
-            Pubkey::from_str("Sysvar1111111111111111111111111111111111111").unwrap(),
-            false,
-            0,
-        );
-        self.add_account(Rent::id(), account);
+    fn add_sysvars(&mut self, processor: &TransactionBatchProcessor<ProgramSvmTestForkGraph>) {
+        let sysvars = Sysvars::default();
+        let (key, account) = sysvars.keyed_account_for_rent_sysvar();
+        self.add_account(key, account);
+
+        let (key, account) = sysvars.keyed_account_for_clock_sysvar();
+        self.add_account(key, account);
+
+        let (key, account) = sysvars.keyed_account_for_epoch_rewards_sysvar();
+        self.add_account(key, account);
+
+        let (key, account) = sysvars.keyed_account_for_epoch_schedule_sysvar();
+        self.add_account(key, account);
+
+        let (key, account) = sysvars.keyed_account_for_last_restart_slot_sysvar();
+        self.add_account(key, account);
+
+        let (key, account) = sysvars.keyed_account_for_slot_hashes_sysvar();
+        self.add_account(key, account);
+
+        let (key, account) = sysvars.keyed_account_for_stake_history_sysvar();
+        self.add_account(key, account);
+
         processor.fill_missing_sysvar_cache_entries(&self.accounts);
     }
 
@@ -218,9 +233,6 @@ impl ProgramSvmTest {
 
     // TODO add additional methods to set/override the internal state (compute_budget, feature_set, fee_structure, rent_collector)
 
-    // TODO this method in the original ProgramTest crate consumes self so that self cannot be reused once the bank was initialized
-    // It would make sense to do it here too.
-
     /// Initialize the processing environment
     pub fn start(&mut self) -> ProgramSvmTestClient {
         let processor = create_transaction_batch_processor(
@@ -229,7 +241,7 @@ impl ProgramSvmTest {
             &self.compute_budget,
             Arc::clone(&self.fork_graph),
         );
-        self.add_rent_sysvar(&processor);
+        self.add_sysvars(&processor);
         let processing_environment = TransactionProcessingEnvironment {
             blockhash: Hash::default(),
             epoch_total_stake: None,
@@ -243,7 +255,7 @@ impl ProgramSvmTest {
         ProgramSvmTestClient {
             processing_environment,
             processor,
-            accounts: &self.accounts,
+            accounts: &mut self.accounts,
         }
     }
 }
@@ -276,7 +288,7 @@ impl ProgramSvmTestUpgradableLoaderState {
 pub struct ProgramSvmTestClient<'a> {
     processing_environment: TransactionProcessingEnvironment<'a>,
     processor: TransactionBatchProcessor<ProgramSvmTestForkGraph>,
-    accounts: &'a ProgramSvmTestAccountLoader, // TODO this should be probably in Arc<RwLock<_>>
+    accounts: &'a mut ProgramSvmTestAccountLoader,
 }
 
 impl<'a> ProgramSvmTestClient<'a> {
@@ -349,6 +361,52 @@ impl<'a> ProgramSvmTestClient<'a> {
 
     pub fn get_account(&self, address: &Pubkey) -> Option<AccountSharedData> {
         self.accounts.get_account_shared_data(address)
+    }
+
+    /// Warp the test environment to a slot by updating sysvars.
+    pub fn warp_to_slot(&mut self, slot: u64) {
+        let old_sysvars = self.processor.sysvar_cache();
+        let mut new_sysvars = Sysvars {
+            clock: (*old_sysvars.get_clock().unwrap_or_default()).clone(),
+            epoch_rewards: (*old_sysvars.get_epoch_rewards().unwrap_or_default()).clone(),
+            epoch_schedule: (*old_sysvars.get_epoch_schedule().unwrap_or_default()).clone(),
+            last_restart_slot: (*old_sysvars.get_last_restart_slot().unwrap_or_default()).clone(),
+            rent: (*old_sysvars.get_rent().unwrap_or_default()).clone(),
+            slot_hashes: SlotHashes::new(
+                &(*old_sysvars.get_slot_hashes().unwrap_or_default()).clone(),
+            ),
+            stake_history: (*old_sysvars.get_stake_history().unwrap_or_default()).clone(),
+        };
+        new_sysvars.warp_to_slot(slot);
+
+        // reset_sysvar_cache needs the write-lock to the old sysvars, so we need to release the previous read lock
+        drop(old_sysvars);
+
+        self.processor.reset_sysvar_cache();
+
+        let (key, account) = new_sysvars.keyed_account_for_rent_sysvar();
+        self.accounts.add_account(key, account);
+
+        let (key, account) = new_sysvars.keyed_account_for_clock_sysvar();
+        self.accounts.add_account(key, account);
+
+        let (key, account) = new_sysvars.keyed_account_for_epoch_rewards_sysvar();
+        self.accounts.add_account(key, account);
+
+        let (key, account) = new_sysvars.keyed_account_for_epoch_schedule_sysvar();
+        self.accounts.add_account(key, account);
+
+        let (key, account) = new_sysvars.keyed_account_for_last_restart_slot_sysvar();
+        self.accounts.add_account(key, account);
+
+        let (key, account) = new_sysvars.keyed_account_for_slot_hashes_sysvar();
+        self.accounts.add_account(key, account);
+
+        let (key, account) = new_sysvars.keyed_account_for_stake_history_sysvar();
+        self.accounts.add_account(key, account);
+
+        self.processor
+            .fill_missing_sysvar_cache_entries(self.accounts);
     }
 
     fn _prepare_transactions(transactions: &[Transaction]) -> Vec<SanitizedTransaction> {
@@ -570,11 +628,14 @@ impl ForkGraph for ProgramSvmTestForkGraph {
 #[cfg(test)]
 mod tests {
     use solana_sdk::{
+        clock::Clock,
+        epoch_schedule::EpochSchedule,
         instruction::{AccountMeta, Instruction},
         program_pack::Pack,
         signature::Keypair,
         signer::Signer,
         system_instruction, system_program,
+        sysvar::SysvarId,
     };
 
     use super::*;
@@ -850,5 +911,37 @@ mod tests {
         let token_data = client.get_account(&token_account.pubkey()).unwrap();
         let token_deserialized = spl_token_2022::state::Account::unpack(token_data.data()).unwrap();
         assert_eq!(token_deserialized.amount, 100000);
+    }
+
+    #[test]
+    fn test_warp_to_slot() {
+        let mut test_program = ProgramSvmTest::new();
+        let mut client = test_program.start();
+
+        let clock: Clock = client
+            .get_account(&Clock::id())
+            .unwrap()
+            .deserialize_data()
+            .unwrap();
+
+        assert_eq!(clock.slot, 0);
+
+        let new_slot = 1000;
+        client.warp_to_slot(new_slot);
+
+        let epoch_schedule: EpochSchedule = client
+            .get_account(&EpochSchedule::id())
+            .unwrap()
+            .deserialize_data()
+            .unwrap();
+
+        let clock: Clock = client
+            .get_account(&Clock::id())
+            .unwrap()
+            .deserialize_data()
+            .unwrap();
+
+        assert_eq!(clock.slot, new_slot);
+        assert_eq!(clock.epoch, epoch_schedule.get_epoch(new_slot));
     }
 }
