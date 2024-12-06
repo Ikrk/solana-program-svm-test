@@ -15,7 +15,7 @@ use solana_program_runtime::{
 };
 use solana_sdk::{
     account::{AccountSharedData, ReadableAccount, WritableAccount},
-    bpf_loader,
+    bpf_loader, bpf_loader_deprecated,
     bpf_loader_upgradeable::{self, UpgradeableLoaderState},
     clock::Slot,
     compute_budget,
@@ -54,16 +54,32 @@ pub const TOKEN_PROGRAM_ID: Pubkey =
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
     solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 pub const MEMO_PROGRAM_ID: Pubkey =
-    solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+    solana_sdk::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 pub const MEMO_V1_PROGRAM_ID: Pubkey =
-    solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+    solana_sdk::pubkey!("Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo");
 
 pub type TransactionProcessingResult = Result<(), TransactionError>;
 pub struct ProgramSvmTestProgramEntry {
     program_id: Pubkey,
     name: String,
+    loader: Loader,
 }
 
+pub enum Loader {
+    V1,
+    V2,
+    UPGRADABLE,
+}
+
+impl Loader {
+    pub fn to_pubkey(&self) -> Pubkey {
+        match self {
+            Loader::V1 => bpf_loader_deprecated::id(),
+            Loader::V2 => bpf_loader::id(),
+            Loader::UPGRADABLE => bpf_loader_upgradeable::id(),
+        }
+    }
+}
 pub struct ProgramSvmTest {
     accounts: ProgramSvmTestAccountLoader,
     fork_graph: Arc<RwLock<ProgramSvmTestForkGraph>>,
@@ -104,11 +120,17 @@ impl ProgramSvmTest {
         );
 
         let mut program_test = ProgramSvmTest::default();
-        program_test.add_program("token", TOKEN_PROGRAM_ID, 0, None);
-        program_test.add_program("token-2022", TOKEN_2022_PROGRAM_ID, 0, None);
-        program_test.add_program("associated-token", ASSOCIATED_TOKEN_PROGRAM_ID, 0, None);
-        program_test.add_program("memo", MEMO_PROGRAM_ID, 0, None);
-        program_test.add_program("memo-v1", MEMO_V1_PROGRAM_ID, 0, None);
+        program_test.add_upgradable_program("token", TOKEN_PROGRAM_ID, 0, None, None);
+        program_test.add_upgradable_program("token-2022", TOKEN_2022_PROGRAM_ID, 0, None, None);
+        program_test.add_upgradable_program(
+            "associated-token",
+            ASSOCIATED_TOKEN_PROGRAM_ID,
+            0,
+            None,
+            None,
+        );
+        program_test.add_program("memo", MEMO_PROGRAM_ID, None, Loader::V2);
+        program_test.add_program("memo-v1", MEMO_V1_PROGRAM_ID, None, Loader::V1);
 
         program_test
     }
@@ -150,7 +172,7 @@ impl ProgramSvmTest {
             let program_data = load_program(&program.name);
             let entry = Arc::new(
                 ProgramCacheEntry::new(
-                    &bpf_loader_upgradeable::id(),
+                    &program.loader.to_pubkey(),
                     cache.environments.program_runtime_v1.clone(),
                     0,
                     0,
@@ -171,25 +193,21 @@ impl ProgramSvmTest {
         &mut self,
         program_name: &'static str,
         program_id: Pubkey,
-        deployment_slot: Slot,
-        builtin_function: Option<BuiltinFunctionWithContext>,
+        _builtin_function: Option<BuiltinFunctionWithContext>,
+        loader: Loader,
     ) -> Pubkey {
         self.programs.push(ProgramSvmTestProgramEntry {
             program_id,
             name: program_name.to_string(),
+            loader,
         });
         let rent = Rent::default();
         let program_account = program_id;
-        let program_data_account =
-            bpf_loader_upgradeable::get_program_data_address(&program_account);
-
-        let state = UpgradeableLoaderState::Program {
-            programdata_address: program_data_account,
-        };
+        let program_data = load_program(program_name);
 
         let mut account_data = AccountSharedData::new_data(
-            rent.minimum_balance(UpgradeableLoaderState::size_of_program()),
-            &state,
+            rent.minimum_balance(program_data.len()),
+            &program_data,
             &bpf_loader::id(),
         )
         .unwrap();
@@ -199,24 +217,6 @@ impl ProgramSvmTest {
             .write()
             .unwrap()
             .insert(program_account, account_data);
-
-        let program_data = load_program(program_name);
-        // let state = ProgramSvmTestUpgradableLoaderState::new(
-        //     deployment_slot,
-        //     upgrade_authority_address,
-        //     program_data,
-        // );
-        let account_data = AccountSharedData::new_data(
-            rent.minimum_balance(program_data.len()),
-            &program_data,
-            &bpf_loader_upgradeable::id(),
-        )
-        .unwrap();
-        self.accounts
-            .account_shared_data
-            .write()
-            .unwrap()
-            .insert(program_data_account, account_data);
 
         program_account
     }
@@ -235,6 +235,7 @@ impl ProgramSvmTest {
         self.programs.push(ProgramSvmTestProgramEntry {
             program_id,
             name: program_name.to_string(),
+            loader: Loader::UPGRADABLE,
         });
 
         let rent = Rent::default();
@@ -742,7 +743,7 @@ mod tests {
         let program_id = Pubkey::new_unique();
 
         let mut test_program = ProgramSvmTest::new();
-        test_program.add_program("hello-solana-program", program_id, 0, None);
+        test_program.add_upgradable_program("hello-solana-program", program_id, 0, None, None);
         let (client, payer) = test_program.start();
 
         let instructions = vec![Instruction::new_with_bytes(program_id, &[], vec![])];
@@ -761,7 +762,7 @@ mod tests {
         let program_id = Pubkey::new_unique();
 
         let mut test_program = ProgramSvmTest::new();
-        test_program.add_program("simple-transfer-program", program_id, 0, None);
+        test_program.add_upgradable_program("simple-transfer-program", program_id, 0, None, None);
         let (client, payer) = test_program.start();
         let payer_amount_before = client.get_account(&payer.pubkey()).unwrap().lamports();
         let amount = 600_000_000u64;
